@@ -31,6 +31,10 @@ def init_db():
     # Tabla de Nonces (Protección Replay)
     c.execute('''CREATE TABLE IF NOT EXISTS nonces
                  (nonce TEXT PRIMARY KEY, timestamp REAL)''')
+    # Tabla de Transaccciones
+    c.execute('''CREATE TABLE IF NOT EXISTS transactions
+                 (tx_id TEXT PRIMARY KEY, origin_account TEXT, destination_account TEXT, 
+                  amount REAL, currency TEXT, timestamp REAL)''')
     
     # Usuario por defecto para pruebas
     c.execute("SELECT * FROM users WHERE username='testuser'")
@@ -165,6 +169,14 @@ async def transfer(
     if not hmac.compare_digest(expected_mac, x_signature):
         conn.close()
         raise HTTPException(status_code=401, detail="Firma HMAC inválida (Fallo de integridad).")
+
+    # 5. Guardar la transacción legítima en la BD
+    data = json.loads(body)
+    c.execute("""INSERT INTO transactions 
+                 (tx_id, origin_account, destination_account, amount, currency, timestamp) 
+                 VALUES (?, ?, ?, ?, ?, ?)""", 
+              (data['tx_id'], data['origin_account'], data['destination_account'], 
+               data['amount'], data['currency'], x_timestamp))
 
     conn.commit()
     conn.close()

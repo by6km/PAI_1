@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+requests
+argon2-cffi

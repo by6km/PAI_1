@@ -6,7 +6,7 @@ import hashlib
 import uuid
 import argparse
 
-BASE_URL = "http://localhost:8080"
+BASE_URL = "http://127.0.0.1:8080"
 
 def register(username, password):
     print(f"[*] Registrando usuario: {username}")

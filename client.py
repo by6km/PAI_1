@@ -126,41 +126,74 @@ def simulate_expired_timestamp(session_token, original_payload):
 # ==========================================
 # PRUEBAS DE CANAL LATERAL (TIMING ATTACKS)
 # ==========================================
+def _interpret_ttest(times_a, times_b, label_a, label_b):
+    """Imprime mediana, diferencia y resultado del t-test de Welch."""
+    import scipy.stats as scipy_stats
+
+    med_a = statistics.median(times_a)
+    med_b = statistics.median(times_b)
+    diff  = abs(med_a - med_b)
+
+    _, p_value = scipy_stats.ttest_ind(times_a, times_b, equal_var=False)
+
+    print(f"Mediana {label_a}: {med_a:.4f} ms")
+    print(f"Mediana {label_b}: {med_b:.4f} ms")
+    print(f"Diferencia       : {diff:.4f} ms")
+    print(f"p-value (Welch)  : {p_value:.4f}")
+    if p_value > 0.05:
+        print("Sin diferencia estadísticamente significativa → Defensa efectiva")
+    else:
+        print("Diferencia estadísticamente significativa → Posible canal lateral")
+
+
 def test_timing_login():
     """
     Mide si existe variación de tiempo al validar contraseñas incorrectas
     en la ruta /login (Defensa por hmac.compare_digest).
+
+    Mejoras metodológicas:
+    - Warmup previo para evitar el sesgo de servidor frío.
+    - Mediciones intercaladas (A, B, A, B...) para que ambas compartan
+      las mismas condiciones de caché y temperatura del sistema.
+    - Mediana en lugar de media para mayor robustez ante picos de latencia.
+    - t-test de Welch para evaluar significancia estadística.
     """
     print("\n[>] --- 5. Evaluando Canal Lateral por Tiempo: /login ---")
     url = f"{BASE_URL}/login"
-    samples = 30
+    samples = 100
 
-    def measure(password):
-        times = []
-        for _ in range(samples):
-            start = time.perf_counter()
-            requests.post(url, json={"username": "testuser", "password": password})
-            end = time.perf_counter()
-            times.append((end - start) * 1000)
-        return statistics.mean(times)
+    # Warmup: descartar primeras peticiones con servidor frío
+    print("    Calentando servidor...")
+    for _ in range(10):
+        requests.post(url, json={"username": "testuser", "password": "warmup"})
 
-    t1 = measure("Aaaaaaaaaa!")  # Falla desde el inicio
-    t2 = measure("Password123?")  # Falla al final del string
+    times_a = []
+    times_b = []
 
-    print(f"Tiempo promedio fallo inicio: {t1:.4f} ms")
-    print(f"Tiempo promedio fallo final : {t2:.4f} ms")
-    print(f"Diferencia: {abs(t1 - t2):.4f} ms (Comprobación de Tiempo Constante)")
+    # Intercalar A y B en cada iteración para igualar condiciones
+    for _ in range(samples):
+        start = time.perf_counter()
+        requests.post(url, json={"username": "testuser", "password": "Aaaaaaaaaa!"})
+        times_a.append((time.perf_counter() - start) * 1000)
+
+        start = time.perf_counter()
+        requests.post(url, json={"username": "testuser", "password": "Password123?"})
+        times_b.append((time.perf_counter() - start) * 1000)
+
+    _interpret_ttest(times_a, times_b, "fallo inicio", "fallo final ")
 
 
 def test_timing_hmac(session_token, original_payload, original_headers):
     """
     Mide si existe variación de tiempo al validar firmas HMAC erróneas
     en la ruta /transfer (Defensa por hmac.compare_digest).
+
+    Mejoras metodológicas: warmup, mediciones intercaladas, mediana y t-test.
     """
     print("\n[>] --- 6. Evaluando Canal Lateral por Tiempo: /api/v1/transfer ---")
     url = f"{BASE_URL}/api/v1/transfer"
     body_bytes = json.dumps(original_payload).encode("utf-8")
-    samples = 30
+    samples = 100
 
     correct_sig = original_headers["X-Signature"]
     # Firma que falla en el primer carácter
@@ -168,25 +201,31 @@ def test_timing_hmac(session_token, original_payload, original_headers):
     # Firma que difiere solo en el último carácter
     bad_sig_end = correct_sig[:-1] + ("0" if correct_sig[-1] != "0" else "1")
 
-    def measure(signature):
-        times = []
-        for _ in range(samples):
-            headers = original_headers.copy()
-            headers["X-Signature"] = signature
-            headers["X-Nonce"] = str(uuid.uuid4())  # Evitamos la colisión de replay
+    def make_headers(signature):
+        h = original_headers.copy()
+        h["X-Signature"] = signature
+        h["X-Nonce"] = str(uuid.uuid4())  # Evitamos colisión de replay
+        return h
 
-            start = time.perf_counter()
-            requests.post(url, data=body_bytes, headers=headers)
-            end = time.perf_counter()
-            times.append((end - start) * 1000)
-        return statistics.mean(times)
+    # Warmup
+    print("    Calentando servidor...")
+    for _ in range(10):
+        requests.post(url, data=body_bytes, headers=make_headers(bad_sig_start))
 
-    t_start = measure(bad_sig_start)
-    t_end = measure(bad_sig_end)
+    times_start = []
+    times_end   = []
 
-    print(f"Tiempo promedio firma errónea (inicio): {t_start:.4f} ms")
-    print(f"Tiempo promedio firma errónea (final) : {t_end:.4f} ms")
-    print(f"Diferencia: {abs(t_start - t_end):.4f} ms (Comprobación de Tiempo Constante)")
+    # Intercalar las dos firmas en cada iteración
+    for _ in range(samples):
+        start = time.perf_counter()
+        requests.post(url, data=body_bytes, headers=make_headers(bad_sig_start))
+        times_start.append((time.perf_counter() - start) * 1000)
+
+        start = time.perf_counter()
+        requests.post(url, data=body_bytes, headers=make_headers(bad_sig_end))
+        times_end.append((time.perf_counter() - start) * 1000)
+
+    _interpret_ttest(times_start, times_end, "firma errónea (inicio)", "firma errónea (final) ")
 
 
 if __name__ == "__main__":

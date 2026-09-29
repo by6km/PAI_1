@@ -1,7 +1,6 @@
 import sqlite3
-import hashlib
 import hmac
-import secrets
+import bcrypt
 import time
 import json
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -49,12 +48,11 @@ def init_db():
     # Usuario por defecto para pruebas
     c.execute("SELECT * FROM users WHERE username='testuser'")
     if not c.fetchone():
-        salt = secrets.token_bytes(32)
         pwd = "Password123!"
-        # RS1: Derivación robusta con PBKDF2-HMAC-SHA256
-        pwd_hash = hashlib.pbkdf2_hmac('sha256', pwd.encode('utf-8'), salt, 100000)
-        c.execute("INSERT INTO users (username, salt, password_hash) VALUES (?, ?, ?)", 
-                  ('testuser', salt, pwd_hash))
+        # RS1: Hash seguro de contraseña con bcrypt (salt embebido automáticamente)
+        pwd_hash = bcrypt.hashpw(pwd.encode('utf-8'), bcrypt.gensalt(rounds=12))
+        c.execute("INSERT INTO users (username, salt, password_hash) VALUES (?, ?, ?)",
+                  ('testuser', None, pwd_hash))
     conn.commit()
     conn.close()
 
@@ -72,10 +70,10 @@ def register(user: UserAuth):
     conn = get_db()
     c = conn.cursor()
     try:
-        salt = secrets.token_bytes(32) # Salt aleatorio de 256 bits
-        pwd_hash = hashlib.pbkdf2_hmac('sha256', user.password.encode('utf-8'), salt, 100000)
-        c.execute("INSERT INTO users (username, salt, password_hash) VALUES (?, ?, ?)", 
-                  (user.username, salt, pwd_hash))
+        # RS1: bcrypt genera y embebe el salt automáticamente en el hash
+        pwd_hash = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt(rounds=12))
+        c.execute("INSERT INTO users (username, salt, password_hash) VALUES (?, ?, ?)",
+                  (user.username, None, pwd_hash))
         conn.commit()
         return {"msg": "Usuario registrado exitosamente."}
     except sqlite3.IntegrityError:
@@ -98,12 +96,10 @@ def login(user: UserAuth):
     if row['locked_until'] > current_time:
         raise HTTPException(status_code=403, detail="Cuenta bloqueada temporalmente por intentos fallidos.")
 
-    salt = row['salt']
-    stored_hash = row['password_hash']
-    pwd_hash = hashlib.pbkdf2_hmac('sha256', user.password.encode('utf-8'), salt, 100000)
-    
-    # RS4: Comparación en tiempo constante de hashes de contraseñas
-    if not hmac.compare_digest(stored_hash, pwd_hash):
+    stored_hash = bytes(row['password_hash'])
+
+    # RS1 + RS4: bcrypt.checkpw verifica el hash e incorpora comparación en tiempo constante
+    if not bcrypt.checkpw(user.password.encode('utf-8'), stored_hash):
         failed_attempts = row['failed_attempts'] + 1
         locked_until = 0
         if failed_attempts >= 3:

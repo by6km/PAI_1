@@ -5,10 +5,20 @@ import secrets
 import time
 import json
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
 app = FastAPI(title="SecBank API")
+
+# CORS: permite peticiones desde el frontend HTML local
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ==========================================
 # BASE DE DATOS

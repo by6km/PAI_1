@@ -47,8 +47,8 @@ def _mac(*fields):
 def user_mac(username, pwd_hash, failed, locked):
     return _mac("user", username, bytes(pwd_hash).hex(), int(failed), float(locked))
 
-def session_mac(username, token, expires):
-    return _mac("session", username, token, float(expires))
+def session_mac(username, token, hmac_key, expires):
+    return _mac("session", username, token, hmac_key, float(expires))
 
 def tx_mac(tx_id, username, origin, dest, amount, currency, ts):
     return _mac("tx", tx_id, username, origin, dest, float(amount), currency, float(ts))
@@ -73,7 +73,7 @@ def init_db():
                   failed_attempts INTEGER DEFAULT 0, locked_until REAL DEFAULT 0,
                   row_mac TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS sessions
-                 (username TEXT, session_token TEXT PRIMARY KEY, expires_at REAL, row_mac TEXT)''')
+                 (username TEXT, session_token TEXT PRIMARY KEY, hmac_key TEXT, expires_at REAL, row_mac TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS nonces
                  (nonce TEXT PRIMARY KEY, timestamp REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS transactions
@@ -102,7 +102,7 @@ def verify_db():
             if not _same(exp, r["row_mac"]):
                 bad["users"].append(r["username"])
         for r in conn.execute("SELECT * FROM sessions").fetchall():
-            exp = session_mac(r["username"], r["session_token"], r["expires_at"])
+            exp = session_mac(r["username"], r["session_token"], r["hmac_key"], r["expires_at"])
             if not _same(exp, r["row_mac"]):
                 bad["sessions"].append(r["session_token"][:8] + "...")
         for r in conn.execute("SELECT * FROM transactions").fetchall():
@@ -189,12 +189,13 @@ def login(user: UserAuth):
 
         # Token de sesión = clave HMAC (32 bytes = 256 bits, CSPRNG)
         session_token = secrets.token_hex(32)
+        hmac_key = secrets.token_hex(32)
         expires_at = now + SESSION_SECONDS
-        conn.execute("INSERT INTO sessions (username, session_token, expires_at, row_mac) VALUES (?, ?, ?, ?)",
-                     (user.username, session_token, expires_at,
-                      session_mac(user.username, session_token, expires_at)))
+        conn.execute("INSERT INTO sessions (username, session_token, hmac_key, expires_at, row_mac) VALUES (?, ?, ?, ?, ?)",
+                     (user.username, session_token, hmac_key, expires_at,
+                      session_mac(user.username, session_token, hmac_key, expires_at)))
         conn.commit()
-        return {"session_token": session_token, "expires_in": SESSION_SECONDS}
+        return {"session_token": session_token, "hmac_key": hmac_key, "expires_in": SESSION_SECONDS}
     finally:
         conn.close()
 
@@ -242,13 +243,13 @@ async def transfer(
         session = conn.execute("SELECT * FROM sessions WHERE session_token=?", (x_session_token,)).fetchone()
         if not session or session['expires_at'] < now:
             raise HTTPException(status_code=401, detail="Sesión inválida o expirada.")
-        if not _same(session_mac(session["username"], session["session_token"], session["expires_at"]),
+        if not _same(session_mac(session["username"], session["session_token"], session["hmac_key"], session["expires_at"]),
                      session["row_mac"]):
             raise HTTPException(status_code=403, detail="Integridad de la sesión comprometida.")
 
         # 4. RS2: MAC sobre nonce|timestamp|cuerpo
         message = f"{x_nonce}|{x_timestamp}|".encode('utf-8') + body
-        expected_mac = hmac.new(x_session_token.encode('utf-8'), message, hashlib.sha256).hexdigest()
+        expected_mac = hmac.new(session["hmac_key"].encode('utf-8'), message, hashlib.sha256).hexdigest()
 
         # RS4: comparación en tiempo constante
         if not hmac.compare_digest(expected_mac.encode('utf-8'), x_signature.encode('utf-8')):

@@ -690,6 +690,7 @@
   /* ===== Estado global ===== */
   const state = {
     token: null,
+    hmacKey: null,
     username: null,
     lastPayload: null,
     lastHeaders: null,
@@ -773,6 +774,7 @@
 
       if (res.ok) {
         state.token    = data.session_token;
+        state.hmacKey  = data.hmac_key;
         state.username = username;
 
         $('dash-username').textContent         = username;
@@ -845,7 +847,7 @@
 
     const tsStr = String(timestamp);
     const key = await crypto.subtle.importKey(
-      'raw', new TextEncoder().encode(state.token),
+      'raw', new TextEncoder().encode(state.hmacKey),
       { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
     );
     const prefix = new TextEncoder().encode(`${nonce}|${tsStr}|`);
@@ -989,7 +991,7 @@
     const expiredTs = String((Date.now() / 1000) - 600);
     const nonce = crypto.randomUUID();
     const key = await crypto.subtle.importKey(
-      'raw', new TextEncoder().encode(state.token),
+      'raw', new TextEncoder().encode(state.hmacKey),
       { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
     );
     const prefix = new TextEncoder().encode(`${nonce}|${expiredTs}|`);

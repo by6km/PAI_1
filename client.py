@@ -37,14 +37,15 @@ def login(username, password):
     )
     if resp.status_code == 200:
         token = resp.json()["session_token"]
+        hmac_key = resp.json()["hmac_key"]
         print(f"[+] Éxito. Token de sesión: {token[:10]}...")
-        return token
+        return token, hmac_key
     else:
         print("[-] Fallo de login:", resp.json())
-        return None
+        return None, None
 
 
-def send_transfer(session_token):
+def send_transfer(session_token, hmac_key):
     payload = {
         "tx_id": str(uuid.uuid4()),
         "origin_account": "ES1234567890123456789012",
@@ -56,7 +57,7 @@ def send_transfer(session_token):
     body_bytes = json.dumps(payload).encode("utf-8")
     nonce = str(uuid.uuid4())
     ts_str = str(time.time())
-    signature = sign(session_token, nonce, ts_str, body_bytes)
+    signature = sign(hmac_key, nonce, ts_str, body_bytes)
 
     headers = {
         "Content-Type": "application/json",
@@ -107,14 +108,14 @@ def simulate_replay(original_body_bytes, original_headers):
     print(f"Respuesta Servidor: {resp.json()}")
 
 
-def simulate_expired_timestamp(session_token, original_payload):
+def simulate_expired_timestamp(session_token, hmac_key, original_payload):
     print("\n[>] --- 4. Simulando Timestamp Expirado ---")
     print("Enviando petición con timestamp de hace 10 minutos...")
 
     body_bytes = json.dumps(original_payload).encode("utf-8")
     ts_str = str(time.time() - 600)
     nonce = str(uuid.uuid4())
-    signature = sign(session_token, nonce, ts_str, body_bytes)
+    signature = sign(hmac_key, nonce, ts_str, body_bytes)
 
     headers = {
         "Content-Type": "application/json",
@@ -149,12 +150,16 @@ def _interpret_ttest(times_a, times_b, label_a, label_b):
     print(f"Diferencia       : {diff:.4f} ms")
     print(f"p-value (Welch)  : {p_value:.4f}")
     if p_value > 0.05:
-        print("Sin diferencia estadísticamente significativa → Defensa efectiva")
+        print("Sin diferencia estadísticamente significativa -> Defensa efectiva")
     else:
-        print("Diferencia estadísticamente significativa → Posible canal lateral")
+        print("Diferencia estadísticamente significativa -> Posible canal lateral")
 
 
 def test_timing_login():
+    import os
+    if os.environ.get("SECBANK_MAX_ATTEMPTS") != "100000":
+        print("\n[!] Saltando test_timing_login() porque SECBANK_MAX_ATTEMPTS no es 100000.")
+        return
     """
     Mide si existe variación de tiempo al validar contraseñas incorrectas
     en la ruta /login (Defensa por hmac.compare_digest).
@@ -185,7 +190,10 @@ def test_timing_login():
         times_a.append((time.perf_counter() - start) * 1000)
 
         start = time.perf_counter()
-        requests.post(url, json={"username": "testuser", "password": "Password123?"})
+        res = requests.post(url, json={"username": "testuser", "password": "Password123?"})
+        if res.status_code == 403:
+            print("\n[!] ATENCIÓN: El servidor devolvió 403. La cuenta está bloqueada y la prueba de timing está invalidada.")
+            break
         times_b.append((time.perf_counter() - start) * 1000)
 
     _interpret_ttest(times_a, times_b, "fallo inicio", "fallo final ")
@@ -244,16 +252,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.action == "demo":
-        token = login("testuser", "Password123!")
+        token, hmac_key = login("testuser", "Password123!")
         if not token:
             print("Asegúrate de que el servidor está corriendo.")
             exit(1)
 
-        payload, headers, body_bytes = send_transfer(token)
+        payload, headers, body_bytes = send_transfer(token, hmac_key)
         simulate_mitm(payload, headers)
         simulate_replay(body_bytes, headers)
-        simulate_expired_timestamp(token, payload)
-        test_timing_login()
+        simulate_expired_timestamp(token, hmac_key, payload)
+        # test_timing_login() eliminado del bloque demo
         test_timing_hmac(token, payload, headers)
         logout(token)
         print("Transferencia tras logout (esperado 401):")
@@ -261,9 +269,9 @@ if __name__ == "__main__":
         print(r.status_code, r.json())
 
     elif args.action == "timing":
-        token = login("testuser", "Password123!")
+        token, hmac_key = login("testuser", "Password123!")
         if token:
-            payload, headers, _ = send_transfer(token)
+            payload, headers, _ = send_transfer(token, hmac_key)
             test_timing_login()
             test_timing_hmac(token, payload, headers)
 

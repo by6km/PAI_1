@@ -10,6 +10,18 @@ import requests
 BASE_URL = "http://127.0.0.1:8080"
 
 
+def sign(token, nonce, ts_str, body_bytes):
+    """HMAC-SHA256 sobre nonce|timestamp|cuerpo (autentica también nonce y timestamp)."""
+    msg = f"{nonce}|{ts_str}|".encode("utf-8") + body_bytes
+    return hmac.new(token.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def logout(token):
+    print("\n[*] Cerrando sesión...")
+    resp = requests.post(f"{BASE_URL}/logout", headers={"X-Session-Token": token})
+    print("Respuesta:", resp.json())
+
+
 def register(username, password):
     print(f"[*] Registrando usuario: {username}")
     resp = requests.post(
@@ -43,16 +55,14 @@ def send_transfer(session_token):
 
     body_bytes = json.dumps(payload).encode("utf-8")
     nonce = str(uuid.uuid4())
-    timestamp = time.time()
-
-    secret_key = session_token.encode("utf-8")
-    signature = hmac.new(secret_key, body_bytes, hashlib.sha256).hexdigest()
+    ts_str = str(time.time())
+    signature = sign(session_token, nonce, ts_str, body_bytes)
 
     headers = {
         "Content-Type": "application/json",
         "X-Signature": signature,
         "X-Nonce": nonce,
-        "X-Timestamp": str(timestamp),
+        "X-Timestamp": ts_str,
         "X-Session-Token": session_token,
     }
 
@@ -102,17 +112,15 @@ def simulate_expired_timestamp(session_token, original_payload):
     print("Enviando petición con timestamp de hace 10 minutos...")
 
     body_bytes = json.dumps(original_payload).encode("utf-8")
-    expired_timestamp = time.time() - 600
+    ts_str = str(time.time() - 600)
     nonce = str(uuid.uuid4())
-
-    secret_key = session_token.encode("utf-8")
-    signature = hmac.new(secret_key, body_bytes, hashlib.sha256).hexdigest()
+    signature = sign(session_token, nonce, ts_str, body_bytes)
 
     headers = {
         "Content-Type": "application/json",
         "X-Signature": signature,
         "X-Nonce": nonce,
-        "X-Timestamp": str(expired_timestamp),
+        "X-Timestamp": ts_str,
         "X-Session-Token": session_token,
     }
 
@@ -247,6 +255,10 @@ if __name__ == "__main__":
         simulate_expired_timestamp(token, payload)
         test_timing_login()
         test_timing_hmac(token, payload, headers)
+        logout(token)
+        print("Transferencia tras logout (esperado 401):")
+        r = requests.post(f"{BASE_URL}/api/v1/transfer", data=body_bytes, headers=headers)
+        print(r.status_code, r.json())
 
     elif args.action == "timing":
         token = login("testuser", "Password123!")

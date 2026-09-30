@@ -742,8 +742,11 @@
     $('tab-register').classList.toggle('active', tab === 'register');
   }
 
-  /* ===== Logout ===== */
-  function logout() {
+    /* ===== Logout ===== */
+  async function logout() {
+    try {
+      await fetch(`${API}/logout`, { method: 'POST', headers: { 'X-Session-Token': state.token } });
+    } catch {}
     state.token = null;
     state.username = null;
     $('topbar-user').classList.remove('visible');
@@ -840,14 +843,16 @@
     const nonce     = crypto.randomUUID();
     const timestamp = Date.now() / 1000;
 
-    // HMAC-SHA256 usando WebCrypto API
+    const tsStr = String(timestamp);
     const key = await crypto.subtle.importKey(
-      'raw',
-      new TextEncoder().encode(state.token),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false, ['sign']
+      'raw', new TextEncoder().encode(state.token),
+      { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
     );
-    const sig = await crypto.subtle.sign('HMAC', key, bodyBytes);
+    const prefix = new TextEncoder().encode(`${nonce}|${tsStr}|`);
+    const msg = new Uint8Array(prefix.length + bodyBytes.length);
+    msg.set(prefix);
+    msg.set(bodyBytes, prefix.length);
+    const sig = await crypto.subtle.sign('HMAC', key, msg);
     const signature = Array.from(new Uint8Array(sig))
       .map(b => b.toString(16).padStart(2, '0')).join('');
 
@@ -855,7 +860,7 @@
       'Content-Type':    'application/json',
       'X-Signature':     signature,
       'X-Nonce':         nonce,
-      'X-Timestamp':     String(timestamp),
+      'X-Timestamp':     tsStr,
       'X-Session-Token': state.token,
     };
 
@@ -980,22 +985,26 @@
     log('<span class="log-dim">Enviando con timestamp de hace 10 minutos...</span>\n');
 
     const bodyBytes = new TextEncoder().encode(JSON.stringify(state.lastPayload));
-    const expiredTs = (Date.now() / 1000) - 600;
 
-    // Recalcular HMAC con token real pero timestamp viejo
+    const expiredTs = String((Date.now() / 1000) - 600);
+    const nonce = crypto.randomUUID();
     const key = await crypto.subtle.importKey(
       'raw', new TextEncoder().encode(state.token),
       { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
     );
-    const sig = await crypto.subtle.sign('HMAC', key, bodyBytes);
+    const prefix = new TextEncoder().encode(`${nonce}|${expiredTs}|`);
+    const msg = new Uint8Array(prefix.length + bodyBytes.length);
+    msg.set(prefix);
+    msg.set(bodyBytes, prefix.length);
+    const sig = await crypto.subtle.sign('HMAC', key, msg);
     const signature = Array.from(new Uint8Array(sig))
       .map(b => b.toString(16).padStart(2, '0')).join('');
 
     const headers = {
       'Content-Type':    'application/json',
       'X-Signature':     signature,
-      'X-Nonce':         crypto.randomUUID(),
-      'X-Timestamp':     String(expiredTs),
+      'X-Nonce':         nonce,
+      'X-Timestamp':     expiredTs,
       'X-Session-Token': state.token,
     };
 

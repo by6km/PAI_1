@@ -1,5 +1,7 @@
 import sqlite3
 import hmac
+import hashlib
+import secrets
 import bcrypt
 import time
 import json
@@ -58,6 +60,9 @@ def init_db():
 
 init_db()
 
+# Hash falso para igualar el tiempo de /login cuando el usuario no existe
+DUMMY_HASH = bcrypt.hashpw(b"dummy", bcrypt.gensalt(rounds=12))
+
 # ==========================================
 # RUTAS DE USUARIO (RS1)
 # ==========================================
@@ -89,6 +94,8 @@ def login(user: UserAuth):
     row = c.fetchone()
     
     if not row:
+        conn.close()
+        bcrypt.checkpw(user.password.encode('utf-8'), DUMMY_HASH)
         raise HTTPException(status_code=401, detail="Credenciales inválidas.")
     
     current_time = time.time()
@@ -138,56 +145,74 @@ async def transfer(
     request: Request,
     x_signature: str = Header(..., description="Firma HMAC-SHA256"),
     x_nonce: str = Header(..., description="UUIDv4 único"),
-    x_timestamp: float = Header(..., description="Timestamp Unix"),
+    x_timestamp: str = Header(..., description="Timestamp Unix (se firma tal cual llega)"),
     x_session_token: str = Header(...)
 ):
-    current_time = time.time()
-    
-    # 1. Validación de Timestamp (Replay Window: ej. 5 minutos)
-    if abs(current_time - x_timestamp) > 300:
+    now = time.time()
+
+    # 1. Ventana de timestamp
+    try:
+        ts = float(x_timestamp)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Timestamp inválido.")
+    if abs(now - ts) > 300:
         raise HTTPException(status_code=400, detail="Timestamp fuera de ventana válida (Posible Replay).")
 
     conn = get_db()
     c = conn.cursor()
-    
-    # 2. RS3: Protección Replay (Comprobar Nonce)
-    c.execute("SELECT nonce FROM nonces WHERE nonce=?", (x_nonce,))
-    if c.fetchone():
-        conn.close()
-        raise HTTPException(status_code=400, detail="Nonce ya utilizado (Ataque Replay Detectado).")
-        
-    c.execute("INSERT INTO nonces (nonce, timestamp) VALUES (?, ?)", (x_nonce, current_time))
-    
-    # 3. Autenticar Sesión y Obtener Clave
-    c.execute("SELECT username, expires_at FROM sessions WHERE session_token=?", (x_session_token,))
-    session = c.fetchone()
-    if not session or session['expires_at'] < current_time:
-        conn.close()
-        raise HTTPException(status_code=401, detail="Sesión inválida o expirada.")
-        
-    # 4. RS2: Integridad y Autenticidad (Calcular MAC esperado)
-    body = await request.body()
-    # Usamos el session_token como clave secreta compartida (>= 256 bits)
-    secret_key = x_session_token.encode('utf-8')
-    expected_mac = hmac.new(secret_key, body, hashlib.sha256).hexdigest()
-    
-    # RS4: Mitigación de Canales Laterales de Tiempo (Comparación en tiempo constante)
-    if not hmac.compare_digest(expected_mac, x_signature):
-        conn.close()
-        raise HTTPException(status_code=401, detail="Firma HMAC inválida (Fallo de integridad).")
+    try:
+        # 2. Purga de nonces caducados (ya no pueden ser válidos por timestamp)
+        c.execute("DELETE FROM nonces WHERE timestamp < ?", (now - 600,))
 
-    # 5. Guardar la transacción legítima en la BD
-    data = json.loads(body)
-    c.execute("""INSERT INTO transactions 
-                 (tx_id, origin_account, destination_account, amount, currency, timestamp) 
-                 VALUES (?, ?, ?, ?, ?, ?)""", 
-              (data['tx_id'], data['origin_account'], data['destination_account'], 
-               data['amount'], data['currency'], x_timestamp))
+        # 3. Autenticar sesión
+        c.execute("SELECT username, expires_at FROM sessions WHERE session_token=?", (x_session_token,))
+        session = c.fetchone()
+        if not session or session['expires_at'] < now:
+            raise HTTPException(status_code=401, detail="Sesión inválida o expirada.")
 
-    conn.commit()
-    conn.close()
-    
+        # 4. RS2: MAC sobre nonce|timestamp|cuerpo
+        body = await request.body()
+        message = f"{x_nonce}|{x_timestamp}|".encode('utf-8') + body
+        expected_mac = hmac.new(x_session_token.encode('utf-8'), message, hashlib.sha256).hexdigest()
+
+        # RS4: comparación en tiempo constante
+        if not hmac.compare_digest(expected_mac.encode('utf-8'), x_signature.encode('utf-8')):
+            raise HTTPException(status_code=401, detail="Firma HMAC inválida (Fallo de integridad).")
+
+        # 5. RS3: el nonce se registra SOLO si la firma es válida
+        try:
+            c.execute("INSERT INTO nonces (nonce, timestamp) VALUES (?, ?)", (x_nonce, now))
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=400, detail="Nonce ya utilizado (Ataque Replay Detectado).")
+
+        # 6. Guardar la transacción legítima
+        data = json.loads(body)
+        try:
+            c.execute("""INSERT INTO transactions
+                         (tx_id, origin_account, destination_account, amount, currency, timestamp)
+                         VALUES (?, ?, ?, ?, ?, ?)""",
+                      (data['tx_id'], data['origin_account'], data['destination_account'],
+                       data['amount'], data['currency'], ts))
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail="tx_id duplicado.")
+        conn.commit()
+    finally:
+        conn.close()
+
     return {"status": "SUCCESS", "msg": "Transferencia verificada y procesada correctamente."}
+
+# ==========================================
+# LOGOUT (RF1.d)
+# ==========================================
+@app.post("/logout")
+def logout(x_session_token: str = Header(...)):
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM sessions WHERE session_token=?", (x_session_token,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"msg": "Sesión cerrada."}
 
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=8080)

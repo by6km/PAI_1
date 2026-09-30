@@ -1,5 +1,6 @@
 import sqlite3
 import hmac
+import os
 import hashlib
 import secrets
 import bcrypt
@@ -20,6 +21,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MAX_ATTEMPTS = int(os.environ.get("SECBANK_MAX_ATTEMPTS", "3"))
+
+SERVER_KEY = os.environ.get("SECBANK_SERVER_KEY", "cambia-esto-en-produccion").encode()
+
+def row_mac(*fields):
+    msg = "|".join(str(f) for f in fields).encode()
+    return hmac.new(SERVER_KEY, msg, hashlib.sha256).hexdigest()
 
 # ==========================================
 # BASE DE DATOS
@@ -45,7 +53,7 @@ def init_db():
     # Tabla de Transaccciones
     c.execute('''CREATE TABLE IF NOT EXISTS transactions
                  (tx_id TEXT PRIMARY KEY, origin_account TEXT, destination_account TEXT, 
-                  amount REAL, currency TEXT, timestamp REAL)''')
+                  amount REAL, currency TEXT, timestamp REAL, row_mac TEXT)''')
     
     # Usuario por defecto para pruebas
     c.execute("SELECT * FROM users WHERE username='testuser'")
@@ -109,7 +117,7 @@ def login(user: UserAuth):
     if not bcrypt.checkpw(user.password.encode('utf-8'), stored_hash):
         failed_attempts = row['failed_attempts'] + 1
         locked_until = 0
-        if failed_attempts >= 3:
+        if failed_attempts >= MAX_ATTEMPTS:
             locked_until = current_time + 60 # Bloqueo de 60 segundos
             failed_attempts = 0 
         c.execute("UPDATE users SET failed_attempts=?, locked_until=? WHERE username=?", 
@@ -188,11 +196,13 @@ async def transfer(
         # 6. Guardar la transacción legítima
         data = json.loads(body)
         try:
+            mac = row_mac(data['tx_id'], data['origin_account'], data['destination_account'],
+                          float(data['amount']), data['currency'], float(ts))
             c.execute("""INSERT INTO transactions
-                         (tx_id, origin_account, destination_account, amount, currency, timestamp)
-                         VALUES (?, ?, ?, ?, ?, ?)""",
+                         (tx_id, origin_account, destination_account, amount, currency, timestamp, row_mac)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)""",
                       (data['tx_id'], data['origin_account'], data['destination_account'],
-                       data['amount'], data['currency'], ts))
+                       data['amount'], data['currency'], ts, mac))
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=409, detail="tx_id duplicado.")
         conn.commit()
@@ -213,6 +223,25 @@ def logout(x_session_token: str = Header(...)):
     finally:
         conn.close()
     return {"msg": "Sesión cerrada."}
+
+def verify_db():
+    """Devuelve los tx_id cuyo row_mac no coincide (fila manipulada)."""
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT * FROM transactions").fetchall()
+    finally:
+        conn.close()
+    bad = []
+    for r in rows:
+        esperado = row_mac(r["tx_id"], r["origin_account"], r["destination_account"],
+                           float(r["amount"]), r["currency"], float(r["timestamp"]))
+        if not hmac.compare_digest(esperado.encode(), (r["row_mac"] or "").encode()):
+            bad.append(r["tx_id"])
+    return bad
+
+_bad = verify_db()
+if _bad:
+    print(f"[!] ALERTA: {len(_bad)} transacciones con integridad rota: {_bad}")
 
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=8080)

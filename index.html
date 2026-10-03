@@ -505,7 +505,8 @@
 
       <!-- LOGIN -->
       <div class="tab-panel active" id="tab-login">
-        <div class="alert alert-danger" id="login-error"></div>
+        <div class="alert alert-warning" id="login-warning"></div>
+        <div class="alert alert-danger"  id="login-error"></div>
         <form id="form-login" novalidate onsubmit="handleLogin(event)">
           <div class="field">
             <label for="login-user">Usuario</label>
@@ -783,9 +784,34 @@
         $('topbar-user').classList.add('visible');
         showView('dashboard');
       } else {
-        showAlert('login-error', data.detail || 'Credenciales incorrectas.');
+        const detail = data.detail;
+
+        if (typeof detail === 'object' && detail !== null && 'attempts_remaining' in detail) {
+          // Contraseña incorrecta → el servidor nos dice cuántos intentos quedan
+          const rem = detail.attempts_remaining;
+          // Ocultamos cualquier aviso previo de intentos
+          $('login-warning').classList.remove('visible');
+
+          if (rem === 0) {
+            // Este intento agotó los intentos → cuenta bloqueada ahora mismo
+            showAlert('login-error',
+              '🔒 Cuenta bloqueada durante 60 segundos por demasiados intentos fallidos.');
+          } else {
+            // Quedan intentos: mostrar aviso amarillo
+            const plural = rem === 1 ? 'intento' : 'intentos';
+            showAlert('login-warning',
+              `⚠️ Contraseña incorrecta. Te ${rem === 1 ? 'queda' : 'quedan'} ${rem} ${plural} antes del bloqueo.`,
+              'warning');
+          }
+        } else {
+          // Otros errores: cuenta bloqueada (403), usuario no existe (401 sin dict), etc.
+          $('login-warning').classList.remove('visible');
+          const msg = typeof detail === 'string' ? detail : 'Credenciales incorrectas.';
+          showAlert('login-error', msg);
+        }
       }
     } catch {
+      $('login-warning').classList.remove('visible');
       showAlert('login-error', 'No se pudo conectar con el servidor. ¿Está corriendo?');
     } finally {
       setLoading('btn-login', false);
@@ -960,13 +986,41 @@
   }
 
   async function attackReplay() {
-    log('<span class="log-info">🔁  Ataque Replay: Reenvío de petición intacta</span>');
-    log('<span class="log-dim">El atacante reenvía exactamente la misma petición firmada...</span>\n');
+    log('<span class="log-info">🔁  Ataque Replay: Reutilización de nonce con timestamp fresco</span>');
+    log('<span class="log-dim">El atacante reutiliza el nonce original y recalcula la firma con timestamp actual...</span>');
+    log('<span class="log-dim">(simula un atacante real que refresca el timestamp para evitar la ventana de replay)\n</span>');
 
     try {
+      // El atacante usa un timestamp fresco para pasar la ventana de tiempo,
+      // pero reutiliza el mismo nonce de la transferencia legítima → RS3 debe bloquearlo.
+      const freshTs = String(Date.now() / 1000);
+      const nonce   = state.lastHeaders['X-Nonce'];  // mismo nonce original
+
+      // Recalcular la firma con el nuevo timestamp (nonce idéntico, body idéntico)
+      const key = await crypto.subtle.importKey(
+        'raw', new TextEncoder().encode(state.hmacKey),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+      );
+      const prefix = new TextEncoder().encode(`${nonce}|${freshTs}|`);
+      const msg = new Uint8Array(prefix.length + state.lastBodyBytes.length);
+      msg.set(prefix);
+      msg.set(state.lastBodyBytes, prefix.length);
+      const sig = await crypto.subtle.sign('HMAC', key, msg);
+      const freshSignature = Array.from(new Uint8Array(sig))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+
+      const replayHeaders = {
+        ...state.lastHeaders,
+        'X-Timestamp': freshTs,        // timestamp actualizado → pasa la ventana
+        'X-Signature': freshSignature, // firma válida → pasa la verificación HMAC
+        // 'X-Nonce' se hereda sin cambios → nonce duplicado → RS3 activo
+      };
+
+      log(`<span class="log-dim">Nonce reutilizado: ${nonce}</span>`);
+
       const res  = await fetch(`${API}/api/v1/transfer`, {
         method: 'POST',
-        headers: state.lastHeaders,
+        headers: replayHeaders,
         body: state.lastBodyBytes,
       });
       const data = await res.json();
@@ -1028,10 +1082,10 @@
   }
 
   async function attackBruteforce() {
-    log('<span class="log-info">🔓  Fuerza bruta: 4 intentos con contraseña incorrecta</span>');
-    log('<span class="log-dim">Probando "ContraseñaIncorrecta!" repetidamente...</span>\n');
+    log('<span class="log-info">🔓  Fuerza bruta: 5 intentos con contraseña incorrecta</span>');
+    log('<span class="log-dim">Probando "ContraseñaIncorrecta!" repetidamente... (bloqueo al 4º intento)\n</span>');
 
-    for (let i = 1; i <= 4; i++) {
+    for (let i = 1; i <= 5; i++) {
       try {
         const res  = await fetch(`${API}/login`, {
           method: 'POST',
@@ -1039,12 +1093,31 @@
           body: JSON.stringify({ username: state.username, password: 'ContraseñaIncorrecta!' }),
         });
         const data = await res.json();
-        const blocked = res.status === 403;
-        log(`Intento ${i}: HTTP <span class="${blocked ? 'log-warn' : 'log-fail'}">${res.status}</span> → ${data.detail}`);
-        if (blocked) {
+
+        if (res.status === 403) {
+          // Cuenta ya estaba bloqueada desde el intento anterior
+          log(`Intento ${i}: HTTP <span class="log-warn">${res.status}</span> → ${data.detail}`);
           log('<span class="log-ok">✅ CUENTA BLOQUEADA — Defensa RS1 (bloqueo temporal) activa.</span>');
           break;
         }
+
+        if (res.status === 401) {
+          const detail = data.detail;
+          const rem = (typeof detail === 'object' && detail !== null) ? detail.attempts_remaining : null;
+
+          if (rem === 0) {
+            // Este intento agotó los intentos → bloqueo activado ahora
+            log(`Intento ${i}: HTTP <span class="log-warn">401</span> → Credenciales inválidas. <span class="log-warn">⚠️ Cuenta bloqueada a partir de ahora.</span>`);
+            log('<span class="log-ok">✅ CUENTA BLOQUEADA — Defensa RS1 (bloqueo temporal) activa.</span>');
+            break;
+          } else if (rem !== null) {
+            const plural = rem === 1 ? 'intento' : 'intentos';
+            log(`Intento ${i}: HTTP <span class="log-fail">401</span> → Credenciales inválidas. <span class="log-warn">Quedan ${rem} ${plural}.</span>`);
+          } else {
+            log(`Intento ${i}: HTTP <span class="log-fail">${res.status}</span> → ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`);
+          }
+        }
+
       } catch (err) {
         log(`<span class="log-fail">Error de red: ${err.message}</span>`);
         break;

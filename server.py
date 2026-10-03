@@ -179,9 +179,15 @@ def login(user: UserAuth):
             if failed >= MAX_ATTEMPTS:
                 locked = now + LOCK_SECONDS
                 failed = 0
+                remaining = 0          # este intento agota los intentos → bloqueo inmediato
+            else:
+                remaining = MAX_ATTEMPTS - failed   # intentos que quedan antes del bloqueo
             _set_user_state(conn, user.username, stored_hash, failed, locked)
             conn.commit()
-            raise HTTPException(status_code=401, detail="Credenciales inválidas.")
+            raise HTTPException(status_code=401, detail={
+                "msg": "Credenciales inválidas.",
+                "attempts_remaining": remaining
+            })
 
         # Éxito: reseteo de intentos y limpieza de sesiones caducadas
         _set_user_state(conn, user.username, stored_hash, 0, 0.0)
